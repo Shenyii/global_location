@@ -1,0 +1,327 @@
+#include "PSO_location.h"
+
+pso_location::pso_location()
+:particle_numble_(50),feature_point_number_(10),variance_of_lidar_point_(1),search_scope_(10)
+{
+    dynamic_reconfigure::Server<global_location::test1Config> server;
+    dynamic_reconfigure::Server<global_location::test1Config>::CallbackType f;
+    f = boost::bind(&pso_location::dynamicCB,this,_1,_2);
+    server.setCallback(f);
+    sub_lidar_ = n_.subscribe("/scan",2,&pso_location::lidarCB,this);
+    sub_map_ = n_.subscribe("/map",2,&pso_location::mapCB,this);
+    PthreadStart();
+    ros::spin();
+}
+
+pso_location::~pso_location()
+{}
+
+void pso_location::dynamicCB(global_location::test1Config& config,uint32_t level)
+{
+    ROS_INFO("reconfigure request:%d,%d,%f",config.particle_number,config.feature_point_number,config.variance_of_lidar_point);
+    particle_numble_ = config.particle_number;
+    feature_point_number_ = config.feature_point_number;
+    search_scope_ = config.search_scope;
+    variance_of_lidar_point_ = config.variance_of_lidar_point;
+    iterations_ = config.iterations;
+}
+
+void pso_location::lidarCB(sensor_msgs::LaserScan scan)
+{
+    watch_point_.clear();
+    geometry_msgs::Pose2D pose2D;
+    for(int i = 0;i < scan.ranges.size();i += scan.ranges.size() / feature_point_number_)
+    {
+        pose2D.x = scan.ranges[i] * cos(scan.angle_min + i * scan.angle_increment);
+        pose2D.y = scan.ranges[i] * sin(scan.angle_min + i * scan.angle_increment);
+        pose2D.theta = 0;
+        watch_point_.push_back(pose2D);
+    }
+}
+
+void pso_location::mapCB(nav_msgs::OccupancyGrid map)
+{
+    global_map_.header.stamp = map.header.stamp;
+    global_map_.header.frame_id = map.header.frame_id;
+    global_map_.info.map_load_time = map.info.map_load_time;
+    global_map_.info.resolution = map.info.resolution;
+    global_map_.info.width = map.info.width;
+    global_map_.info.height = map.info.height;
+    global_map_.info.origin.position.x = map.info.origin.position.x;
+    global_map_.info.origin.position.y = map.info.origin.position.y;
+    global_map_.info.origin.position.z = map.info.origin.position.z;
+    global_map_.info.origin.orientation.x = map.info.origin.orientation.x;
+    global_map_.info.origin.orientation.y = map.info.origin.orientation.y;
+    global_map_.info.origin.orientation.z = map.info.origin.orientation.z;
+    global_map_.info.origin.orientation.w = map.info.origin.orientation.w;
+    global_map_.data.resize(map.data.size());
+    for(int i = 0;i < map.data.size();i++)
+    {
+        global_map_.data[i] = map.data[i];
+    }
+    cout << "load the map successed" << endl;
+    cout << global_map_.info.origin.orientation.z << "," << global_map_.info.origin.orientation.w << endl;
+}
+
+void pso_location::startGlobalLocation()
+{
+    analogInputData();
+    ros::Duration(1).sleep();
+    cout << "please enter to begin." << endl;
+    getchar();
+    if(global_map_.data.size() == 0)
+    {
+        cout << "hav't receive the map!" << endl;
+        return;
+    }
+    if(watch_point_.size() == 0)
+    {
+        cout << "hav't receive the lidar point!" << endl;
+        return;
+    }
+    cout << "start the global location." << endl;
+    //cout << "the distance to obstacle is: " << distanceToObstacle(7.52998,-1.3263) - 0 << endl;//////////////////////////////////////////////////////////
+    productParticleSwarm();
+    calculateParticleWeight();
+    for(int i = 0;i < iterations_;i++)
+    {
+        resampleParticleSwarm();
+        calculateParticleWeight();
+    }
+    cout << "end the global location." << endl;
+    sort(pose_swarm_.begin(),pose_swarm_.end());
+    cout << "the pose is:(" << (pose_swarm_.end() - 1)->point.x << "," << (pose_swarm_.end() - 1)->point.y << "," << (pose_swarm_.end() - 1)->point.theta << ")" << (pose_swarm_.end() - 1)->weight << endl;
+}
+
+void pso_location::productParticleSwarm()
+{
+    cout << "product the particle swarm." << endl;
+    pose_swarm_.clear();
+    for(int i = 0;i < particle_numble_;i++)
+    {
+        particle pose;
+        pose.point.x = rand() % (int)(global_map_.info.width * global_map_.info.resolution) + rand() % 100 / 100.0;
+        pose.point.y = rand() % (int)(global_map_.info.height * global_map_.info.resolution) + rand() % 100 / 100.0;
+        pose.point.theta = (rand() % 360 + rand() % 100 / 100.0) * 3.14159265 / 180.0;
+        pose.weight = 0;
+        if(global_map_.data[pose.point.x / global_map_.info.resolution+ pose.point.y * global_map_.info.width / global_map_.info.resolution] != 0)
+        {
+            i--;
+        }
+        else
+        {
+            pose_swarm_.push_back(pose);
+        }
+    }
+}
+
+void pso_location::resampleParticleSwarm()
+{
+    cout << "resample particle swarm." << endl;
+    sort(pose_swarm_.begin(),pose_swarm_.end());
+    if(pose_swarm_.size() < particle_numble_)
+    {
+        for(int i = 0;i < particle_numble_ - pose_swarm_.size();i++)
+        {
+            particle pose;
+            pose.point.x = 0;
+            pose.point.y = 0;
+            pose.point.theta = 0;
+            pose.weight = 0;
+            pose_swarm_.insert(pose_swarm_.begin(),pose);
+        }
+    }
+    else if(pose_swarm_.size() > particle_numble_)
+    {
+        pose_swarm_.erase(pose_swarm_.begin(),pose_swarm_.begin() + pose_swarm_.size() - particle_numble_);
+    }
+    for(int i = 0;i < pose_swarm_.size() / 4;i++)
+    {
+        pose_swarm_[i].point.x = rand() % (int)(global_map_.info.width * global_map_.info.resolution) + rand() % 100 / 100.0;
+        pose_swarm_[i].point.y = rand() % (int)(global_map_.info.height * global_map_.info.resolution) + rand() % 100 / 100.0;
+        pose_swarm_[i].point.theta = (rand() % 360 + rand() % 100 / 100.0) * 3.14159265 / 180.0;
+        pose_swarm_[i].weight = 0;
+        if(global_map_.data[pose_swarm_[i].point.x / global_map_.info.resolution+ pose_swarm_[i].point.y * global_map_.info.width / global_map_.info.resolution] != 0)
+        {
+            i--;
+        }
+    }
+    for(int i = pose_swarm_.size() / 4;i < pose_swarm_.size() / 4 * 3;i++)
+    {
+        pose_swarm_[i].point.x = pose_swarm_[i].point.x + (rand() % 100 - 50) / 25.0;
+        pose_swarm_[i].point.y = pose_swarm_[i].point.y + (rand() % 100 - 50) / 25.0;
+        pose_swarm_[i].point.theta = pose_swarm_[i].point.theta + (rand() % 100 - 50) / 25.0;
+        pose_swarm_[i].weight = 0;
+        if(global_map_.data[pose_swarm_[i].point.x / global_map_.info.resolution+ pose_swarm_[i].point.y * global_map_.info.width / global_map_.info.resolution] != 0)
+        {
+            i--;
+        }
+    }
+    for(int i = pose_swarm_.size() / 4 * 3;i < pose_swarm_.size();i++)
+    {
+        pose_swarm_[i].point.x += (pose_swarm_[pose_swarm_.size() - 1].point.x - pose_swarm_[i].point.x) / 5;
+        pose_swarm_[i].point.y += (pose_swarm_[pose_swarm_.size() - 1].point.y - pose_swarm_[i].point.y) / 5;
+        pose_swarm_[i].point.theta += (pose_swarm_[pose_swarm_.size() - 1].point.theta - pose_swarm_[i].point.theta) / 5;
+        pose_swarm_[i].weight = 0;
+    }
+}
+
+void pso_location::calculateParticleWeight()
+{
+    cout << "calculate particle weight." << endl;
+    //particle_numble_ = 1;
+    pose_swarm_[0].point.x = 5;
+    pose_swarm_[0].point.y = 4;
+    pose_swarm_[0].point.theta = 3.14159165;
+    pose_swarm_[0].weight = 0;
+    cout << "particle numver is:" << pose_swarm_.size() << endl;
+    for(int n = 0;n < particle_numble_;n++)
+    {
+        for(int i = 0;i < feature_point_number_;i++)
+        {
+            double map_x = cos(pose_swarm_[n].point.theta) * watch_point_[i].x - sin(pose_swarm_[n].point.theta) * watch_point_[i].y + pose_swarm_[n].point.x;
+            double map_y = cos(pose_swarm_[n].point.theta) * watch_point_[i].y + sin(pose_swarm_[n].point.theta) * watch_point_[i].x + pose_swarm_[n].point.y;
+            pose_swarm_[n].weight += exp((0 - distanceToObstacle(map_x,map_y)) / variance_of_lidar_point_);
+            //cout << "distance is:" << exp(0 - distanceToObstacle(map_x,map_y)) / variance_of_lidar_point_ << endl;
+        }
+    }
+
+    sort(pose_swarm_.begin(),pose_swarm_.end());
+    cout << "the max weight is: " << (pose_swarm_.end() - 1)->weight << endl;
+
+}
+
+double pso_location::distanceToObstacle(double x,double y)
+{
+    int width = x / global_map_.info.resolution;
+    int height = y / global_map_.info.resolution;
+    int obs_x;
+    int obs_y;
+    for(int i = 0;i < search_scope_;i++)
+    {
+        for(int j = 0 - i;j < i + 1;j++)
+        {
+            if((width + j >= 0) && (width + j < global_map_.info.width) && (height + i >= 0) && (height + i < global_map_.info.height))
+            {
+                if(global_map_.data[(height + i) * global_map_.info.width + width + j] == 100)
+                {
+                    obs_x = width + j;
+                    obs_y = height + i;
+                    // cout << "obstacle is0:(" << obs_x << "," << obs_y << ")";
+                    // cout << "(" << width << "," << height << ")" << endl;
+                    return sqrt((obs_x * global_map_.info.resolution - x) * (obs_x * global_map_.info.resolution - x) + (obs_y * global_map_.info.resolution - y) * (obs_y * global_map_.info.resolution - y));
+                    break;
+                }
+            }
+        }
+        for(int j = 0 - i;j < i + 1;j++)
+        {
+            if((width + j >= 0) && (width + j < global_map_.info.width) && (height - i >= 0) && (height - i < global_map_.info.height))
+            {
+                if(global_map_.data[(height - i) * global_map_.info.width + width + j] == 100)
+                {
+                    obs_x = width + j;
+                    obs_y = height - i;
+                    // cout << "obstacle is1:(" << obs_x << "," << obs_y << ")";
+                    // cout << "(" << width << "," << height << ")" << endl;
+                    return sqrt((obs_x * global_map_.info.resolution - x) * (obs_x * global_map_.info.resolution - x) + (obs_y * global_map_.info.resolution - y) * (obs_y * global_map_.info.resolution - y));
+                    break;
+                }
+            }
+        }
+        for(int j = 0 - i;j < i + 1;j++)
+        {
+            if((width + i >= 0) && (width + i < global_map_.info.width) && (height + j >= 0) && (height + j < global_map_.info.height))
+            {
+                if(global_map_.data[(height + j) * global_map_.info.width + width + i] == 100)
+                {
+                    obs_x = width + i;
+                    obs_y = height + j;
+                    // cout << "obstacle is2:(" << obs_x << "," << obs_y << ")";
+                    // cout << "(" << width << "," << height << ")" << endl;
+                    return sqrt((obs_x * global_map_.info.resolution - x) * (obs_x * global_map_.info.resolution - x) + (obs_y * global_map_.info.resolution - y) * (obs_y * global_map_.info.resolution - y));
+                    break;
+                }
+            }
+        }
+        for(int j = 0 - i;j < i + 1;j++)
+        {
+            if((width - i >= 0) && (width - i < global_map_.info.width) && (height + j >= 0) && (height + j < global_map_.info.height))
+            {
+                if(global_map_.data[(height + j) * global_map_.info.width + width + i] == 100)
+                {
+                    obs_x = width - i;
+                    obs_y = height + j;
+                    // cout << "obstacle is3:(" << obs_x << "," << obs_y << ")";
+                    // cout << "(" << width << "," << height << ")" << endl;
+                    return sqrt((obs_x * global_map_.info.resolution - x) * (obs_x * global_map_.info.resolution - x) + (obs_y * global_map_.info.resolution - y) * (obs_y * global_map_.info.resolution - y));
+                    break;
+                }
+            }
+        }
+    }
+    return 100;
+}
+
+void pso_location::PthreadStart()
+{
+    if(pthread_create(&m_tid_,NULL,ThreadStart,(void*)this) != 0)
+    {
+        ROS_INFO("Start location thread failed!");
+        return; 
+    }
+}
+
+void* pso_location::ThreadStart(void * arg)
+{
+    pso_location *ptr =(pso_location*) arg;
+    ptr->startGlobalLocation();
+    return NULL;
+}
+
+bool operator<(particle particle1,particle particle2)
+{
+    return particle1.weight < particle2.weight;
+}
+
+void pso_location::analogInputData()
+{
+    //global_map_.header.stamp = map.header.stamp;
+    global_map_.header.frame_id = "test_frame";
+    //global_map_.info.map_load_time = map.info.map_load_time;
+    global_map_.info.resolution = 0.5;
+    global_map_.info.width = 10;
+    global_map_.info.height = 10;
+    global_map_.info.origin.position.x = 0;
+    global_map_.info.origin.position.y = 0;
+    global_map_.info.origin.position.z = 0;
+    global_map_.info.origin.orientation.x = 0;
+    global_map_.info.origin.orientation.y = 0;
+    global_map_.info.origin.orientation.z = 0;
+    global_map_.info.origin.orientation.w = 1;
+    global_map_.data.resize(100);
+    for(int i = 0;i < 100;i++)
+    {
+        global_map_.data[i] = 0;
+    }
+    for(int i = 0;i < 10;i++)
+    {
+        global_map_.data[90 + i] = 100;
+    }
+    for(int i = 0;i < 10;i++)
+    {
+        //global_map_.data[9 + 10 * i] = 100;
+    }
+    cout << "load the map successed2" << endl;
+
+    watch_point_.clear();
+    geometry_msgs::Pose2D pose2D;
+    for(int i = 0;i < feature_point_number_;i++)
+    {
+        pose2D.x = i * 0.2 - 2;
+        pose2D.y = i * 0.2;
+        pose2D.theta = 0;
+        watch_point_.push_back(pose2D);
+    }
+}
+
